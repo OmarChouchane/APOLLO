@@ -65,11 +65,11 @@ MAX_CV_CHARS = 6000
 EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
 LEGACY_SIGNATURE_BLOCK = (
-    "I'd be glad to connect and discuss any internship opportunity.\n\n"
-    "Linkedin : Omar Chouchane | LinkedIn\n"
-    "Portfolio : Portfolio of Omar Chouchane\n"
-    "GitHub : Omar Chouchane\n\n"
-    "Best regards,\n"
+    "Je serais ravi d'echanger avec vous au sujet de toute opportunite de stage.\n\n"
+    "LinkedIn : https://www.linkedin.com/in/omar-chouchane/\n"
+    "GitHub : https://github.com/OmarChouchane\n"
+    "Portfolio : https://portfolio-omarchouchane.vercel.app/\n\n"
+    "Bien cordialement,\n"
     "Omar Chouchane\n\n"
     "omar.chouchane@insat.ucar.tn | +216 52 834 833"
 )
@@ -406,16 +406,18 @@ Destinataire :
 Tache : redige un email de prospection de stage tres personnalise, humain, direct, simple et convaincant, ecrit par {sender_label}.
 
 Regles obligatoires :
-1. Redige tout l'email en francais naturel (fr-FR), fluide et humain. Evite le ton robotique et les formulations generees par IA.
-2. Base-toi uniquement sur le CV ci-dessus. N'invente aucun projet, aucune experience, aucun chiffre, aucune technologie.
-3. Si le nom du destinataire est connu, utilise-le dans l'accroche. Sinon, utilise "Bonjour,".
-4. Ecris a la premiere personne ("je") en tant que {sender_label}. Ne parle jamais de "le candidat".
-5. N'infere jamais l'annee academique, le niveau, le statut de diplome, ni la seniorite depuis les dates. Utilise uniquement ce qui est explicitement indique dans le CV.
-6. Fais ressortir clairement un positionnement DevOps / Cloud (ou l'un des deux selon le contexte) avec 2-3 elements concrets du CV tres pertinents pour l'entreprise.
-7. Corps de mail court et fort: 3 paragraphes maximum, phrases courtes, sans blabla, sans formule vide.
-8. Evite strictement les cliches du type "J'espere que vous allez bien".
-9. Le sujet doit etre court, pro, specifique au stage DevOps/Cloud, et donne envie d'ouvrir l'email.
-10. Termine le corps avec ce bloc de signature EXACT, inchange, meme ponctuation et meme langue, sans rien ajouter apres :
+1. Redige tout l'email en francais naturel (fr-FR), fluide, humain et professionnel.
+2. Base-toi uniquement sur le CV ci-dessus. N'invente aucun projet, aucune experience, aucune technologie, aucun chiffre non justifie.
+3. Reste general et percutant: parle des points forts du candidat (DevOps, Cloud, CI/CD, securite, automatisation, AWS, Kubernetes, Terraform) sans faire une liste trop detaillee de chaque outil ou de chaque mission.
+4. Ne recopie jamais textuellement des phrases du CV. Reformule de maniere sobre et naturelle.
+5. Si le nom du destinataire est connu, utilise-le dans l'accroche. Sinon, utilise "Bonjour,".
+6. Ecris a la premiere personne ("je") en tant que {sender_label}. Ne parle jamais de "le candidat".
+7. N'infere jamais l'annee academique, le niveau, le statut de diplome, ni la seniorite depuis les dates. Utilise uniquement ce qui est explicitement indique dans le CV.
+8. Fais ressortir un profil DevOps / Cloud solide, polyvalent et credible, avec 2-3 points forts maximum, sans surexpliquer.
+9. Corps de mail court et fort: 3 paragraphes maximum, phrases courtes, sans blabla, sans formule vide.
+10. Evite strictement les cliches du type "J'espere que vous allez bien".
+11. Le sujet doit etre court, pro, general, et donne envie d'ouvrir l'email sans etre trop technique.
+12. Termine le corps avec ce bloc de signature EXACT, inchange, sans rien ajouter apres :
 {signature}
 
 Reponds uniquement en JSON valide (sans markdown, sans texte autour) :
