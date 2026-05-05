@@ -64,6 +64,16 @@ CONFIG_FILE = Path("config.local.json")
 MAX_CV_CHARS = 6000
 EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
+LEGACY_SIGNATURE_BLOCK = (
+    "I'd be glad to connect and discuss any internship opportunity.\n\n"
+    "Linkedin : Omar Chouchane | LinkedIn\n"
+    "Portfolio : Portfolio of Omar Chouchane\n"
+    "GitHub : Omar Chouchane\n\n"
+    "Best regards,\n"
+    "Omar Chouchane\n\n"
+    "omar.chouchane@insat.ucar.tn | +216 52 834 833"
+)
+
 # ── Palette (Catppuccin Mocha) ─────────────────────────────────────────────────
 C = {
     "base":    "#111318",
@@ -323,12 +333,8 @@ def resolve_sender_name(cv_text: str, sender_name: str = "",
 
 def build_signature_block(sender_name: str, sender_email: str = "",
                           sender_phone: str = "") -> str:
-    lines = ["Best regards,", sender_name.strip()]
-    if sender_phone.strip():
-        lines.append(sender_phone.strip())
-    if sender_email.strip():
-        lines.append(sender_email.strip())
-    return "\n".join(line for line in lines if line)
+    # Use the user-provided legacy closing to keep tone and branding consistent.
+    return LEGACY_SIGNATURE_BLOCK
 
 
 def enforce_signature(body: str, signature_block: str) -> str:
@@ -341,7 +347,8 @@ def enforce_signature(body: str, signature_block: str) -> str:
         return body
 
     signoff_pattern = (
-        r"\n\s*(?:best regards|kind regards|regards|sincerely|best|thanks|thank you),?"
+        r"\n\s*(?:best regards|kind regards|regards|sincerely|best|thanks|thank you|"
+        r"cordialement|bien a vous|bien a toi|bien a vous|salutations),?"
         r"\s*\n[\s\S]*$"
     )
     body = re.sub(signoff_pattern, "", body, count=1, flags=re.IGNORECASE).rstrip()
@@ -383,35 +390,35 @@ def build_prompt(cv_text: str, contact: Dict[str, str], goal: str,
 
     signature = build_signature_block(sender_label, sender_email, sender_phone)
 
-    return f"""You are an expert email copywriter helping {sender_label} reach out for: {goal}
+    return f"""Tu es un expert en copywriting d'emails de candidature. Ton objectif est d'aider {sender_label} a obtenir un stage: {goal}
 
-About the sender ({sender_label}):
+A propos du candidat ({sender_label}) :
 {contact_info}{extra_info}
-The full CV / Resume (use this as the authoritative source for the sender's background, skills, experience, and education):
+CV complet du candidat (source unique de verite pour ses competences, experiences et formation) :
 \"\"\"
 {cv_text}
 \"\"\"
 
-Recipient:
-- Name: {name}
-- Company: {company}
+Destinataire :
+- Nom: {name}
+- Entreprise: {company}
 {role_line}{extras}{context_block}
-Task: Write a highly personalized, professional, concise outreach email from {sender_label}.
+Tache : redige un email de prospection de stage tres personnalise, humain, direct, simple et convaincant, ecrit par {sender_label}.
 
-Rules:
-1. Derive the sender's background, skills, and experience entirely from the CV text above — do NOT invent details.
-2. If the recipient name is known, address them directly (e.g. "Dear [Name],"); otherwise use "Dear Hiring Manager,".
-3. Write in first person as {sender_label}; never refer to the sender as "the sender" in the email.
-4. Do not infer academic year, graduation timing, degree status, job titles, or experience level from dates. If the CV explicitly says an academic status such as "fourth year", "4th year", "final year", or similar, use that exact status; otherwise omit the year/status completely.
-5. Never downgrade or change academic status. For example, do not write "third year" unless the CV explicitly says "third year" or "3rd year".
-6. Reference 1-2 specific aspects of the company/role that make it a strong fit for the sender's background.
-7. Keep the body to 3-4 short paragraphs — direct, warm, and specific, with no generic opener.
-8. End with a soft call to action ("I'd welcome a quick discussion") before the signature.
-9. The email body must end with this exact signature block, on separate lines, with no extra text after it:
+Regles obligatoires :
+1. Redige tout l'email en francais naturel (fr-FR), fluide et humain. Evite le ton robotique et les formulations generees par IA.
+2. Base-toi uniquement sur le CV ci-dessus. N'invente aucun projet, aucune experience, aucun chiffre, aucune technologie.
+3. Si le nom du destinataire est connu, utilise-le dans l'accroche. Sinon, utilise "Bonjour,".
+4. Ecris a la premiere personne ("je") en tant que {sender_label}. Ne parle jamais de "le candidat".
+5. N'infere jamais l'annee academique, le niveau, le statut de diplome, ni la seniorite depuis les dates. Utilise uniquement ce qui est explicitement indique dans le CV.
+6. Fais ressortir clairement un positionnement DevOps / Cloud (ou l'un des deux selon le contexte) avec 2-3 elements concrets du CV tres pertinents pour l'entreprise.
+7. Corps de mail court et fort: 3 paragraphes maximum, phrases courtes, sans blabla, sans formule vide.
+8. Evite strictement les cliches du type "J'espere que vous allez bien".
+9. Le sujet doit etre court, pro, specifique au stage DevOps/Cloud, et donne envie d'ouvrir l'email.
+10. Termine le corps avec ce bloc de signature EXACT, inchange, meme ponctuation et meme langue, sans rien ajouter apres :
 {signature}
-10. Never use "I hope this email finds you well" or similar clichés.
 
-Respond with ONLY valid JSON (no markdown, no extra text):
+Reponds uniquement en JSON valide (sans markdown, sans texte autour) :
 {{"subject": "...", "body": "..."}}"""
 
 
