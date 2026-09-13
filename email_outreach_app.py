@@ -13,6 +13,7 @@ import time
 import re
 import threading
 from datetime import datetime
+import unicodedata
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -63,9 +64,11 @@ LOG_FILE    = Path("outreach_log.json")
 CONFIG_FILE = Path("config.local.json")
 MAX_CV_CHARS = 6000
 EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+FIXED_EMAIL_SUBJECT = "Candidature de stage d’été – DevOps / Cloud / Software Development"
 
 LEGACY_SIGNATURE_BLOCK = (
-    "Je serais ravi d'echanger avec vous au sujet de toute opportunite de stage.\n\n"
+    "Je serais ravi d'échanger avec vous au sujet de toute opportunité de stage.\n\n"
     "LinkedIn : https://www.linkedin.com/in/omar-chouchane/\n"
     "GitHub : https://github.com/OmarChouchane\n"
     "Portfolio : https://portfolio-omarchouchane.vercel.app/\n\n"
@@ -264,6 +267,12 @@ def valid_email(addr: str) -> bool:
     return bool(EMAIL_RE.match(addr.strip()))
 
 
+def _normalize_key_name(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value)
+    value = value.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\W+", "_", value.strip().lower()).strip("_")
+
+
 def parse_cv(path: str) -> str:
     suffix = Path(path).suffix.lower()
     text = ""
@@ -289,16 +298,108 @@ def parse_cv(path: str) -> str:
     return text[:MAX_CV_CHARS] + ("…" if len(text) > MAX_CV_CHARS else "")
 
 
+def _normalize_contact_record(row: Dict[str, str]) -> Dict[str, str]:
+    normalized = dict(row)
+
+    # French CSV aliases used by the real contacts file.
+    if not normalized.get("company"):
+        for key in (
+            "nom_de_l_entreprise",
+            "entreprise",
+            "company",
+            "nom_entreprise",
+        ):
+            if normalized.get(key):
+                normalized["company"] = normalized[key]
+                break
+
+    if not normalized.get("email"):
+        for key in ("e_mail", "email", "e_mail_address", "mail"):
+            if normalized.get(key):
+                normalized["email"] = normalized[key]
+                break
+
+    if not normalized.get("phone"):
+        for key in ("telephone", "téléphone", "phone", "tel"):
+            if normalized.get(key):
+                normalized["phone"] = normalized[key]
+                break
+
+    if not normalized.get("company_context"):
+        for key in (
+            "description_de_l_activite_anglais",
+            "description",
+            "activity_description",
+            "company_description",
+        ):
+            if normalized.get(key):
+                normalized["company_context"] = normalized[key]
+                break
+
+    if not normalized.get("sector"):
+        for key in ("secteur_majeur_bvd", "secteur", "sector"):
+            if normalized.get(key):
+                normalized["sector"] = normalized[key]
+                break
+
+    if not normalized.get("country"):
+        for key in ("pays_du_stage", "country", "pays", "stage_country"):
+            if normalized.get(key):
+                normalized["country"] = normalized[key]
+                break
+
+    contact_field = normalized.get("contact_entreprise", "").strip()
+    if contact_field and not normalized.get("email"):
+        m = EMAIL_IN_TEXT_RE.search(contact_field)
+        if m:
+            normalized["email"] = m.group(0)
+
+    # Preserve a human-readable label for previews when the company name is missing.
+    if not normalized.get("name") and normalized.get("contact_entreprise"):
+        normalized["name"] = normalized["contact_entreprise"]
+
+    return normalized
+
+
+def _contacts_language_for_path(path: str) -> str:
+    name = Path(path).name.lower()
+    if name in {"tech_companies.csv", "contacts_entreprises_2024.csv"}:
+        return "fr"
+    return ""
+
+
 def load_contacts(path: str) -> List[Dict[str, str]]:
+    # Try to read with pandas if available, letting it infer separators.
     if HAS_PANDAS:
-        df = pd.read_csv(path)
-        df.columns = [c.strip().lower() for c in df.columns]
-        return df.where(pd.notna(df), "").astype(str).to_dict(orient="records")
+        try:
+            df = pd.read_csv(path, sep=None, engine="python")
+        except Exception:
+            df = pd.read_csv(path)
+        # normalize column names to snake_case
+        df.columns = [_normalize_key_name(c) for c in df.columns]
+        df = df.where(pd.notna(df), "").astype(str)
+        records = df.to_dict(orient="records")
+        return [_normalize_contact_record(r) for r in records]
+
     rows: List[Dict[str, str]] = []
     with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(sample)
+            delimiter = dialect.delimiter
+        except Exception:
+            delimiter = ","
+        reader = csv.DictReader(f, delimiter=delimiter)
         for row in reader:
-            rows.append({k.strip().lower(): v.strip() for k, v in row.items()})
+            normalized: Dict[str, str] = {}
+            for k, v in row.items():
+                if k is None:
+                    continue
+                key = _normalize_key_name(k)
+                normalized[key] = (v or "").strip()
+            rows.append(_normalize_contact_record(normalized))
     return rows
 
 
@@ -331,10 +432,42 @@ def resolve_sender_name(cv_text: str, sender_name: str = "",
     return infer_name_from_email(sender_email)
 
 
+def detect_language_from_country(contact: Dict[str, str]) -> str:
+    """Return 'fr' for French or 'en' for English based on contact['country']."""
+    country = (contact.get("country") or "").strip().lower()
+    if not country:
+        return "en"
+
+    # Two-letter ISO codes mapping
+    iso_map = {
+        "fr": "fr", "tn": "fr", "ma": "fr", "dz": "fr",
+        "be": "fr", "ch": "fr", "lu": "fr",
+    }
+    if len(country) == 2 and country in iso_map:
+        return iso_map[country]
+
+    francophone = (
+        "france tunisia tunisie morocco maroc algeria algerie belgium belgique "
+        "switzerland suisse luxembourg"
+    )
+    for token in francophone.split():
+        if token in country:
+            return "fr"
+    return "en"
+
+
 def build_signature_block(sender_name: str, sender_email: str = "",
                           sender_phone: str = "") -> str:
-    # Use the user-provided legacy closing to keep tone and branding consistent.
-    return LEGACY_SIGNATURE_BLOCK
+    display_name = (sender_name or "Omar Chouchane").strip() or "Omar Chouchane"
+    contact_parts = []
+    if sender_email:
+        contact_parts.append(sender_email.strip())
+    if sender_phone:
+        contact_parts.append(sender_phone.strip())
+    contact_line = " | ".join(contact_parts)
+    if contact_line:
+        return f"Bien cordialement,\n{display_name}\n\n{contact_line}"
+    return f"Bien cordialement,\n{display_name}"
 
 
 def enforce_signature(body: str, signature_block: str) -> str:
@@ -355,18 +488,91 @@ def enforce_signature(body: str, signature_block: str) -> str:
     return f"{body}\n\n{signature_block}"
 
 
+def sanitize_company_context(ctx: str) -> str:
+    """Return a short French paraphrase for company research context.
+
+    If the scraped/researched context appears English-heavy, map common keywords
+    to short French phrases to avoid leaking raw English into the email.
+    """
+    if not ctx:
+        return ""
+    s = ctx.strip()
+    # quick heuristic: presence of common English function words
+    english_indicators = (" the ", " and ", " is ", " of ", " for ", "in the", "company", "editor", "bank", "airline", "headquarters")
+    low = s.lower()
+    score = sum(1 for t in english_indicators if t in low)
+    # if many english indicators, produce a short french paraphrase using keywords
+    if score >= 2:
+        # keyword mapping
+        if "bank" in low or "banking" in low or "banque" in low:
+            return "éditeur de solutions bancaires en France"
+        if "airline" in low or ("air" in low and "line" in low):
+            return "acteur du transport aérien"
+        if "software" in low or "éditeur" in low or "solutions" in low:
+            return "éditeur de logiciels ou de solutions techniques"
+        if "consult" in low or "services" in low or "service" in low:
+            return "fournisseur de services techniques"
+        # fallback short french summary
+        words = re.findall(r"[A-Za-z]+", low)[:6]
+        brief = " ".join(words).strip()
+        return (brief[:200] + "...") if brief else "votre environnement technique"
+    # If looks French or neutral, collapse to one cleaned paragraph and strip odd markup
+    cleaned = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s)).strip()
+    # keep only first 250 chars to avoid long dumps
+    return cleaned if len(cleaned) <= 250 else cleaned[:247] + "..."
+
+
+def ensure_portfolio_links(body: str, sender_extra: str = "") -> str:
+    """Replace [lien] placeholders with actual URLs and ensure all links are present."""
+    if not body:
+        return body
+    # Replace all [lien] / [link] placeholders with portfolio URL
+    body = re.sub(r"\[\s*lien\s*\]|\[\s*link\s*\]", "https://portfolio-omarchouchane.vercel.app", body, flags=re.IGNORECASE)
+    
+    low = body.lower()
+    links_to_add = []
+    
+    # Check for and add missing links (only if not already present with actual URL)
+    if "linkedin" not in low or "linkedin.com" not in low:
+        links_to_add.append("LinkedIn : https://linkedin.com/in/omar-chouchane")
+    if "github" not in low or "github.com" not in low:
+        links_to_add.append("GitHub : https://github.com/OmarChouchane")
+    if "portfolio" not in low or "portfolio-omarchouchane" not in low:
+        links_to_add.append("Portfolio : https://portfolio-omarchouchane.vercel.app")
+    
+    if not links_to_add:
+        return body
+    
+    # remove existing signoff if present (similar to enforce_signature)
+    signoff_pattern = (
+        r"\n\s*(?:best regards|kind regards|regards|sincerely|best|thanks|thank you|"
+        r"cordialement|bien a vous|bien a toi|bien a vous|salutations),?"
+        r"\s*\n[\s\S]*$"
+    )
+    stripped = re.sub(signoff_pattern, "", body, count=1, flags=re.IGNORECASE).rstrip()
+    added = stripped + "\n\n" + "\n".join(links_to_add)
+    return added
+
+
 def build_prompt(cv_text: str, contact: Dict[str, str], goal: str,
                  company_context: str = "",
                  sender_name: str = "", sender_email: str = "",
-                 sender_phone: str = "", sender_extra: str = "") -> str:
-    name    = get_field(contact, "name", "full_name", "first_name", "contact", default="there")
+                 sender_phone: str = "", sender_extra: str = "",
+                 language: str = "fr") -> str:
+    language = "fr"
+    name    = get_field(contact, "name", "full_name", "first_name", "contact",
+                        default=get_field(contact, "company", "organization", "employer", "firm", default="there"))
     company = get_field(contact, "company", "organization", "employer", "firm",
                         default="your organization")
     role    = get_field(contact, "role", "position", "title", "job_title")
 
-    skip = {"name", "full_name", "first_name", "email", "e-mail", "email_address",
+    skip = {"name", "full_name", "first_name", "email", "e_mail", "e-mail", "email_address",
             "company", "organization", "employer", "firm", "role", "position",
-            "title", "job_title", "contact"}
+            "title", "job_title", "contact", "contact_entreprise", "filiere",
+            "pays_du_stage", "pays", "pays_stage", "stage_country", "country",
+            "nom_de_l_entreprise", "nom_entreprise", "phone", "telephone", "tel",
+            "description", "company_context", "description_de_l_activite_anglais",
+            "secteur_majeur_bvd", "sector", "section_nace_rev_2"}
     extras = "\n".join(
         f"- {k.replace('_', ' ').title()}: {v}"
         for k, v in contact.items()
@@ -374,7 +580,7 @@ def build_prompt(cv_text: str, contact: Dict[str, str], goal: str,
     )
     role_line = f"- Role: {role}\n" if role else ""
     context_block = (
-        f'\nCompany Research (use this to personalize the email):\n"""\n{company_context}\n"""\n'
+        f'\nCompany Research (reformule en francais naturel et ne recopie jamais mot a mot):\n"""\n{company_context}\n"""\n'
         if company_context else ""
     )
 
@@ -390,7 +596,41 @@ def build_prompt(cv_text: str, contact: Dict[str, str], goal: str,
 
     signature = build_signature_block(sender_label, sender_email, sender_phone)
 
-    return f"""Tu es un expert en copywriting d'emails de candidature. Ton objectif est d'aider {sender_label} a obtenir un stage: {goal}
+    if language and language.lower().startswith("en"):
+        # English prompt aligned with the sample email structure and tone
+        return f"""You are an expert copywriter for internship outreach emails. Your goal is to help {sender_label} write a standout cold email for a summer internship, with the option of an extended internship or part-time role.
+
+Candidate ({sender_label}):
+{contact_info}{extra_info}
+Full CV (single source of truth for skills, experience and education):
+\"\"\"
+{cv_text}
+\"\"\"
+
+Recipient:
+- Name: {name}
+- Company: {company}
+{role_line}{extras}{context_block}
+
+Task: write a top-tier cold email in English (en-US) that follows this structure: short greeting, brief interest sentence, one paragraph about profile and skills, one paragraph about why this company, one paragraph about internship interest and fit, then a short attachment / links block, then the exact signature.
+
+Rules (must follow):
+1. Use first person ("I") and keep the tone human, concise, and confident.
+2. Base everything only on the CV above. Do NOT invent projects, dates, degrees, employers, or metrics not present in the CV.
+3. Keep the body powerful but short: 4 paragraphs max, short sentences, no fluff.
+4. Mention broad strengths only, not a long technical inventory. Focus on 2-3 areas such as DevOps, Cloud, software development, infrastructure, automation, CI/CD, Kubernetes, Docker, Terraform, backend, reliability.
+5. Do not name specific employers or detailed projects unless they are explicitly in the CV and essential. Prefer general framing such as hands-on projects, academic work, and infrastructure-oriented experience.
+6. Make the company-specific paragraph concrete and genuine using the company description / sector, and explain why it stands out.
+7. Explicitly say the user is looking for a summer internship and is also open to an extended internship or part-time position.
+8. Include a short line inviting the reader to review the attached CV and the portfolio / LinkedIn / GitHub links if present.
+9. The subject must be short and compelling, for example: "Summer Internship Application – DevOps / Cloud / Software Development".
+10. End the body with this exact signature block and nothing after it:
+{signature}
+
+Respond ONLY with valid JSON (no surrounding text): {{"subject": "...", "body": "..."}}"""
+
+    # Default: French prompt aligned with the sample email structure and tone
+    return f"""Tu es un expert en copywriting d'emails de candidature. Ton objectif est d'aider {sender_label} à rédiger un cold email qui se démarque pour un stage d'été, avec aussi la possibilité d'un stage prolongé ou d'un poste à temps partiel si cela intéresse l'entreprise.
 
 A propos du candidat ({sender_label}) :
 {contact_info}{extra_info}
@@ -403,25 +643,107 @@ Destinataire :
 - Nom: {name}
 - Entreprise: {company}
 {role_line}{extras}{context_block}
-Tache : redige un email de prospection de stage tres personnalise, humain, direct, simple et convaincant, ecrit par {sender_label}.
+
+Tache : redige un email de prospection en francais qui suit exactement cette structure :
+1. Une salutation simple et professionnelle.
+2. Une phrase d'accroche courte et directe.
+3. Un paragraphe sur le profil, la formation et les competences principales.
+4. Un paragraphe sur ce qui t'attire chez l'entreprise en t'appuyant sur sa description.
+5. Un paragraphe sur le stage recherche et la valeur que tu peux apporter.
+6. Un court bloc final AVEC LES TROIS LIENS COMPLETS (pas de placeholders) :
+   Portfolio : https://portfolio-omarchouchane.vercel.app | LinkedIn : https://linkedin.com/in/omar-chouchane | GitHub : https://github.com/OmarChouchane
+7. La signature exacte, sans rien ajouter apres.
 
 Regles obligatoires :
-1. Redige tout l'email en francais naturel (fr-FR), fluide, humain et professionnel.
-2. Base-toi uniquement sur le CV ci-dessus. N'invente aucun projet, aucune experience, aucune technologie, aucun chiffre non justifie.
-3. Reste general et percutant: parle des points forts du candidat (DevOps, Cloud, CI/CD, securite, automatisation, AWS, Kubernetes, Terraform) sans faire une liste trop detaillee de chaque outil ou de chaque mission.
-4. Ne recopie jamais textuellement des phrases du CV. Reformule de maniere sobre et naturelle.
-5. Si le nom du destinataire est connu, utilise-le dans l'accroche. Sinon, utilise "Bonjour,".
-6. Ecris a la premiere personne ("je") en tant que {sender_label}. Ne parle jamais de "le candidat".
-7. N'infere jamais l'annee academique, le niveau, le statut de diplome, ni la seniorite depuis les dates. Utilise uniquement ce qui est explicitement indique dans le CV.
-8. Fais ressortir un profil DevOps / Cloud solide, polyvalent et credible, avec 2-3 points forts maximum, sans surexpliquer.
-9. Corps de mail court et fort: 3 paragraphes maximum, phrases courtes, sans blabla, sans formule vide.
-10. Evite strictement les cliches du type "J'espere que vous allez bien".
-11. Le sujet doit etre court, pro, general, et donne envie d'ouvrir l'email sans etre trop technique.
-12. Termine le corps avec ce bloc de signature EXACT, inchange, sans rien ajouter apres :
+1. Rédige tout l'email en français naturel (fr-FR), fluide, humain et professionnel.
+2. Adopte un ton proche de l'exemple fourni : direct, sincère, sobre, sans formule générique.
+3. Commence par une salutation simple et professionnelle. Si le nom est connu, utilise-le ; sinon, utilise "Bonjour {company}," ou "Bonjour l'équipe {company},".
+4. La première phrase après la salutation doit dire que tu es étudiant en 4ème année en ingénierie informatique, réseaux et télécommunications à l'INSAT (Institut National des Sciences Appliquées et de Technologie).
+5. Utilise "je" à la première personne. Ne parle jamais de "le candidat".
+6. Base-toi uniquement sur le CV ci-dessus. N'invente aucun projet, aucune expérience, aucune technologie, aucun chiffre non justifié.
+7. Fais ressortir 2 à 3 atouts maximum, en termes larges et puissants : DevOps, Cloud, développement logiciel, automatisation, CI/CD, Docker, Kubernetes, Terraform, backend, fiabilité.
+8. Ne cite pas des entreprises ou projets spécifiques comme exemples de réalisations, sauf si cela est explicitement nécessaire et déjà présent dans le CV. Préfère une formulation générale sur les projets, l'infrastructure et l'automatisation.
+9. Explique pourquoi l'entreprise t'intéresse en t'appuyant sur sa description ou son secteur, de façon concrète et naturelle.
+10. Mentionne clairement que le stage recherché est un stage d'été, que tu es ouvert à un format à distance, et que tu peux aussi envisager une relocalisation si besoin.
+11. Le corps du mail doit rester court mais impactant : 4 paragraphes maximum, phrases courtes, sans blabla.
+12. Évite strictement les clichés du type "J'espère que vous allez bien".
+13. Fais en sorte que le mail paraisse réel, original et pas générique.
+14. Le sujet doit être court, pro, accrocheur, et proche du style : "Candidature stage d'été – DevOps / Cloud / Développement logiciel" ou une variante équivalente.
+15. N'utilise jamais les libellés du CSV (GL, IIA, IMI, NACE, secteur, etc.) dans le contenu du mail.
+16. Les liens Portfolio, LinkedIn et GitHub DOIVENT toujours être des URLs complètes et valides:
+   - Portfolio : https://portfolio-omarchouchane.vercel.app
+   - LinkedIn : https://linkedin.com/in/omar-chouchane
+   - GitHub : https://github.com/OmarChouchane
+   Ne utilise JAMAIS de placeholders comme [lien], [link], ou des pointillés.
+17. Termine le corps avec ce bloc de signature EXACT, inchangé, sans rien ajouter après :
 {signature}
+18. Si le contexte entreprise est en anglais, reformule-le en francais naturel et ne recopie jamais de phrases anglaises mot a mot.
 
-Reponds uniquement en JSON valide (sans markdown, sans texte autour) :
-{{"subject": "...", "body": "..."}}"""
+Reponds uniquement en JSON valide (sans markdown, sans texte autour).
+IMPORTANT: Retourne STRICTEMENT un objet JSON valide et rien d'autre. Exemples ou explications sont interdits.
+- L'objet doit avoir exactement deux clés: `subject` et `body`.
+- `subject`: la ligne d'objet en français.
+- `body`: le contenu complet du message en français, en respectant la structure demandée (salutation, 3 paragraphes principaux + court bloc liens, signature).
+- Le `body` doit contenir explicitement (en français) les tokens: "Portfolio", "LinkedIn", "GitHub", "stage d'été", "INSAT".
+- Ne recopie jamais des libellés CSV ou des métadonnées brutes; reformule en français naturel.
+Retour final (strictement): {{"subject": "...", "body": "..."}}"""
+
+
+def build_french_fallback_email(cv_text: str, contact: Dict[str, str], goal: str,
+                                company_context: str = "",
+                                sender_name: str = "", sender_email: str = "",
+                                sender_phone: str = "", sender_extra: str = "") -> Tuple[str, str]:
+    sender_label = resolve_sender_name(cv_text, sender_name, sender_email)
+    company = get_field(contact, "company", "organization", "employer", "firm", default="votre equipe")
+    recipient_name = get_field(contact, "name", "full_name", "first_name", "contact", default="")
+    greeting = f"Bonjour {recipient_name}," if recipient_name and recipient_name != company else f"Bonjour {company},"
+
+    context = company_context.strip()
+    if not context:
+        context = "votre environnement technique et votre approche orientée produit"
+
+    subject = FIXED_EMAIL_SUBJECT
+
+    signature = build_signature_block(sender_label, sender_email, sender_phone)
+    portfolio_lines = [
+        "Portfolio : portfolio-omarchouchanes-projects.vercel.app",
+        "LinkedIn : linkedin.com/in/omar-chouchane",
+        "GitHub : github.com/OmarChouchane",
+    ]
+    if sender_extra.strip():
+        portfolio_lines.insert(0, sender_extra.strip())
+
+    body = f"""{greeting}
+
+Je suis étudiant en 4ème année en ingénierie informatique, réseaux et télécommunications à l'INSAT (Institut National des Sciences Appliquées et de Technologie).
+
+Je vous contacte parce que {context} correspond exactement au type d'environnement que je souhaite rejoindre.
+
+Je porte un fort intérêt pour le DevOps, le Cloud et le développement logiciel. Mes projets m'ont amené à travailler sur Kubernetes, Docker, Terraform, les pipelines CI/CD et l'automatisation d'infrastructures, avec une attention particulière à la fiabilité et à la simplicité d'exploitation.
+
+Ce qui m'intéresse chez vous, c'est la possibilité de contribuer à des systèmes concrets tout en continuant à apprendre aux côtés d'une équipe qui construit des produits ou services techniques de manière sérieuse. Je recherche un stage d'été, je suis ouvert à un format à distance, et je peux aussi envisager une relocalisation si besoin.
+
+Veuillez trouver mon CV ci-joint. Je serais ravi d'échanger avec vous sur une opportunité qui pourrait vous être utile.
+
+{chr(10).join(portfolio_lines)}
+
+{signature}"""
+    return subject, body
+
+
+def is_complete_french_email(body: str) -> bool:
+    text = (body or "").strip()
+    # Accept if all required tokens are present regardless of length
+    required_tokens = ("Portfolio", "LinkedIn", "GitHub", "stage d'été", "INSAT")
+    lowers = text.lower()
+    found = sum(1 for t in required_tokens if t.lower() in lowers)
+    if found == len(required_tokens):
+        return True
+    # Relaxed acceptance: if most tokens present and reasonable length
+    if found >= 4 and len(text) >= 50:
+        return True
+    # Otherwise consider incomplete
+    return False
 
 
 # ── Company Researcher ─────────────────────────────────────────────────────────
@@ -559,6 +881,14 @@ def parse_llm_json(text: str) -> Tuple[str, str]:
 
 # ── LLM Client ─────────────────────────────────────────────────────────────────
 
+class LLMProviderError(Exception):
+    def __init__(self, provider: str, status_code: int = None, text: str = ""):
+        super().__init__(f"Provider {provider} error: {status_code}")
+        self.provider = provider
+        self.status_code = status_code
+        self.text = text
+
+
 class LLMClient:
     _REGISTRY: Dict[str, Tuple[str, str]] = {
         "OpenAI":      ("https://api.openai.com/v1/chat/completions",
@@ -578,17 +908,43 @@ class LLMClient:
         "Cohere":      ("https://api.cohere.com/v2/chat",
                         "command-r-plus-08-2024"),
     }
-    MAX_RETRIES  = 4
+    MAX_RETRIES  = 3
     BASE_BACKOFF = 10
+    GENERATE_TIMEOUT = 60  # 120s timeout per contact to prevent indefinite hangs
 
-    def __init__(self, provider: str, api_key: str, model: str = ""):
+    def __init__(self, provider: str, api_key: str, model: str = "", llm_debug_provider: bool = False):
         self.provider  = provider
         self.api_key   = api_key
         base, default  = self._REGISTRY.get(provider, ("", ""))
         self._base_url = base
         self.model     = model.strip() or default
+        self.llm_debug_provider = bool(llm_debug_provider)
 
     def generate(self, prompt: str) -> str:
+        """Generate with timeout wrapper to prevent indefinite hangs."""
+        result = [None]
+        exception = [None]
+
+        def _generate():
+            try:
+                result[0] = self._generate_internal(prompt)
+            except Exception as e:
+                exception[0] = e
+
+        thread = threading.Thread(target=_generate, daemon=True)
+        thread.start()
+        thread.join(timeout=self.GENERATE_TIMEOUT)
+
+        if thread.is_alive():
+            raise TimeoutError(f"LLM generation timed out after {self.GENERATE_TIMEOUT}s for {self.provider}")
+        if exception[0]:
+            raise exception[0]
+        if result[0] is None:
+            raise RuntimeError(f"LLM generation returned None for {self.provider}/{self.model}")
+        return result[0]
+
+    def _generate_internal(self, prompt: str) -> str:
+        """Internal generate logic with retries (moved from original generate)."""
         dispatch = {
             "Gemini":    self._gemini,
             "Anthropic": self._anthropic,
@@ -599,32 +955,66 @@ class LLMClient:
             try:
                 return fn(prompt)
             except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
+                status = None
+                text = ""
+                if e.response is not None:
+                    status = e.response.status_code
+                    try:
+                        text = e.response.text
+                    except Exception:
+                        text = ""
+                # On 402/429 surface a provider error so callers can attempt fallback
+                if status in (402, 429):
+                    raise LLMProviderError(self.provider, status, text)
+                # Otherwise, handle 429 with backoff
+                if status == 429:
                     wait = self.BASE_BACKOFF * (2 ** attempt)
                     ra = e.response.headers.get("Retry-After")
                     if ra:
                         try:
                             wait = max(wait, int(ra))
-                        except ValueError:
+                        except Exception:
                             pass
                     if attempt < self.MAX_RETRIES - 1:
                         time.sleep(wait)
                         continue
                 raise
+            except requests.RequestException:
+                # Network/connection errors — let retries loop handle
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(self.BASE_BACKOFF * (2 ** attempt))
+                    continue
         raise RuntimeError("LLM retries exhausted")
 
     def _gemini(self, prompt: str) -> str:
         url = f"{self._base_url}/{self.model}:generateContent?key={self.api_key}"
-        r = requests.post(
-            url,
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
-            },
-            timeout=45,
-        )
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        try:
+            r = requests.post(
+                url,
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+                },
+                timeout=45,
+            )
+            # Capture provider response for debugging if requested
+            if self.llm_debug_provider:
+                try:
+                    p = Path(f"llm_provider_{self.provider}_resp_{int(time.time())}.txt")
+                    p.write_text(f"URL: {url}\nSTATUS: {r.status_code}\n\n{r.text}", encoding="utf-8")
+                except Exception:
+                    pass
+            r.raise_for_status()
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except requests.RequestException as exc:
+            # write available response text if present
+            try:
+                if hasattr(exc, 'response') and exc.response is not None and self.llm_debug_provider:
+                    p = Path(f"llm_provider_{self.provider}_error_{int(time.time())}.txt")
+                    p.write_text(f"ERROR: {exc}\nSTATUS: {exc.response.status_code}\n\n{exc.response.text}", encoding="utf-8")
+            except Exception:
+                pass
+            raise
 
     def _openai_compat(self, prompt: str) -> str:
         headers: Dict[str, str] = {
@@ -634,53 +1024,112 @@ class LLMClient:
         if self.provider == "OpenRouter":
             headers["HTTP-Referer"] = "https://email-outreach-app"
             headers["X-Title"]      = "Email Outreach Automation"
-        r = requests.post(
-            self._base_url,
-            headers=headers,
-            json={
-                "model":       self.model,
-                "messages":    [{"role": "user", "content": prompt}],
-                "temperature": 0.7,
-                "max_tokens":  1024,
-            },
-            timeout=45,
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        try:
+            r = requests.post(
+                self._base_url,
+                headers=headers,
+                json={
+                    "model":       self.model,
+                    "messages":    [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "max_tokens":  1024,
+                },
+                timeout=45,
+            )
+            if self.llm_debug_provider:
+                try:
+                    p = Path(f"llm_provider_{self.provider}_resp_{int(time.time())}.txt")
+                    p.write_text(f"URL: {self._base_url}\nSTATUS: {r.status_code}\n\n{r.text}", encoding="utf-8")
+                except Exception:
+                    pass
+            r.raise_for_status()
+            data = r.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise LLMProviderError(self.provider, r.status_code, f"OpenAI-compatible response missing choices: {data}")
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            if content is None:
+                finish_reason = choices[0].get("finish_reason")
+                detail = {
+                    "finish_reason": finish_reason,
+                    "message_keys": list(message.keys()),
+                    "response_keys": list(data.keys()),
+                }
+                raise LLMProviderError(self.provider, r.status_code, f"OpenAI-compatible response missing content: {detail}")
+            return content
+        except requests.RequestException as exc:
+            try:
+                if hasattr(exc, 'response') and exc.response is not None and self.llm_debug_provider:
+                    p = Path(f"llm_provider_{self.provider}_error_{int(time.time())}.txt")
+                    p.write_text(f"ERROR: {exc}\nSTATUS: {exc.response.status_code}\n\n{exc.response.text}", encoding="utf-8")
+            except Exception:
+                pass
+            raise
 
     def _anthropic(self, prompt: str) -> str:
-        r = requests.post(
-            self._base_url,
-            headers={
-                "x-api-key":         self.api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type":      "application/json",
-            },
-            json={
-                "model":      self.model,
-                "max_tokens": 1024,
-                "messages":   [{"role": "user", "content": prompt}],
-            },
-            timeout=45,
-        )
-        r.raise_for_status()
-        return r.json()["content"][0]["text"]
+        try:
+            r = requests.post(
+                self._base_url,
+                headers={
+                    "x-api-key":         self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type":      "application/json",
+                },
+                json={
+                    "model":      self.model,
+                    "max_tokens": 1024,
+                    "messages":   [{"role": "user", "content": prompt}],
+                },
+                timeout=45,
+            )
+            if self.llm_debug_provider:
+                try:
+                    p = Path(f"llm_provider_{self.provider}_resp_{int(time.time())}.txt")
+                    p.write_text(f"URL: {self._base_url}\nSTATUS: {r.status_code}\n\n{r.text}", encoding="utf-8")
+                except Exception:
+                    pass
+            r.raise_for_status()
+            return r.json()["content"][0]["text"]
+        except requests.RequestException as exc:
+            try:
+                if hasattr(exc, 'response') and exc.response is not None and self.llm_debug_provider:
+                    p = Path(f"llm_provider_{self.provider}_error_{int(time.time())}.txt")
+                    p.write_text(f"ERROR: {exc}\nSTATUS: {exc.response.status_code}\n\n{exc.response.text}", encoding="utf-8")
+            except Exception:
+                pass
+            raise
 
     def _cohere(self, prompt: str) -> str:
-        r = requests.post(
-            self._base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model":    self.model,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=45,
-        )
-        r.raise_for_status()
-        return r.json()["message"]["content"][0]["text"]
+        try:
+            r = requests.post(
+                self._base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":    self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=45,
+            )
+            if self.llm_debug_provider:
+                try:
+                    p = Path(f"llm_provider_{self.provider}_resp_{int(time.time())}.txt")
+                    p.write_text(f"URL: {self._base_url}\nSTATUS: {r.status_code}\n\n{r.text}", encoding="utf-8")
+                except Exception:
+                    pass
+            r.raise_for_status()
+            return r.json()["message"]["content"][0]["text"]
+        except requests.RequestException as exc:
+            try:
+                if hasattr(exc, 'response') and exc.response is not None and self.llm_debug_provider:
+                    p = Path(f"llm_provider_{self.provider}_error_{int(time.time())}.txt")
+                    p.write_text(f"ERROR: {exc}\nSTATUS: {exc.response.status_code}\n\n{exc.response.text}", encoding="utf-8")
+            except Exception:
+                pass
+            raise
 
 
 # ── Email Sender ───────────────────────────────────────────────────────────────
@@ -787,18 +1236,20 @@ class CVInfoThread(QThread):
 
     def __init__(self, cv_text: str,
                  provider: str = "", api_key: str = "", model: str = "",
+                 llm_debug_provider: bool = False,
                  parent=None):
         super().__init__(parent)
         self.cv_text  = cv_text
         self.provider = provider
         self.api_key  = api_key
         self.model    = model
+        self.llm_debug_provider = bool(llm_debug_provider)
 
     def run(self):
         info = extract_sender_info_from_cv(self.cv_text)
         if self.api_key and self.provider:
             try:
-                llm = LLMClient(self.provider, self.api_key, self.model)
+                llm = LLMClient(self.provider, self.api_key, self.model, llm_debug_provider=self.llm_debug_provider)
                 prompt = (
                     "Extract the following fields from this CV text and return ONLY valid JSON "
                     "(no markdown, no extra text):\n"
@@ -841,7 +1292,7 @@ class GenerationThread(QThread):
 
     def run(self):
         cfg   = self.cfg
-        llm   = LLMClient(cfg["provider"], cfg["api_key"], cfg.get("model", ""))
+        llm   = LLMClient(cfg["provider"], cfg["api_key"], cfg.get("model", ""), llm_debug_provider=cfg.get("llm_debug_provider", False))
         total = len(self.contacts)
         drafts: List[DraftEmail] = []
 
@@ -865,14 +1316,23 @@ class GenerationThread(QThread):
                 self.sig_progress.emit(i + 1, total)
                 continue
 
-            company_context = ""
+            company_context = get_field(
+                contact,
+                "company_context",
+                "description",
+                "description_de_l_activite_anglais",
+                default="",
+            )
+            company_context = sanitize_company_context(company_context)
             if cfg.get("research") and company:
                 self.sig_status.emit(f"Researching {company}…")
                 website = get_field(contact, "website", "url", "homepage", "site")
-                company_context = self._researcher.research(company, website)
-                if company_context:
+                researched_context = self._researcher.research(company, website)
+                if researched_context:
+                    researched_context = sanitize_company_context(researched_context)
+                    company_context = f"{company_context}\n\n{researched_context}".strip() if company_context else researched_context
                     self.sig_log.emit(
-                        f"[{i+1}/{total}] Context: {company} ({len(company_context)} chars)",
+                        f"[{i+1}/{total}] Context: {company} ({len(researched_context)} chars)",
                         "info",
                     )
                 else:
@@ -883,24 +1343,116 @@ class GenerationThread(QThread):
             self.sig_status.emit(f"Generating draft for {name}…")
             self.sig_log.emit(f"[{i+1}/{total}] Generating → {name} <{email}>", "info")
             try:
-                raw = llm.generate(
-                    build_prompt(
+                lang = "fr"
+                retries = int(cfg.get("llm_retries", 2))
+                subject = body = ""
+                for attempt in range(1, retries + 1):
+                    prompt_text = build_prompt(
+                        self.cv_text, contact, cfg["goal"], company_context,
+                        sender_name=cfg.get("sender_name", ""),
+                        sender_email=cfg.get("sender_email", ""),
+                        sender_phone=cfg.get("sender_phone", ""),
+                        sender_extra=cfg.get("sender_extra", ""),
+                        language=lang,
+                    )
+                    try:
+                        raw = llm.generate(prompt_text)
+                    except LLMProviderError as ple:
+                        self.sig_log.emit(f"[{i+1}/{total}] Provider {ple.provider} returned {ple.status_code} — attempting fallbacks", "warn")
+                        # Try configured fallbacks from cfg
+                        fallbacks = cfg.get("provider_fallbacks", [])
+                        fallback_succeeded = False
+                        for fb in fallbacks:
+                            try:
+                                p_name = fb.get("provider")
+                                p_key = fb.get("api_key")
+                                p_model = fb.get("model", "")
+                                if not p_name or not p_key:
+                                    continue
+                                self.sig_log.emit(f"[{i+1}/{total}] Trying fallback provider {p_name}", "info")
+                                fb_llm = LLMClient(p_name, p_key, p_model, llm_debug_provider=cfg.get("llm_debug_provider", False))
+                                raw = fb_llm.generate(prompt_text)
+                                fallback_succeeded = True
+                                # replace llm so subsequent repair attempts use the successful provider
+                                llm = fb_llm
+                                break
+                            except Exception as e:
+                                self.sig_log.emit(f"[{i+1}/{total}] Fallback {fb.get('provider')} failed: {e}", "warn")
+                                continue
+                        if not fallback_succeeded:
+                            raise
+                    try:
+                        subject, body = parse_llm_json(raw)
+                    except Exception as e:
+                        self.sig_log.emit(f"[{i+1}/{total}] Parse error from LLM (attempt {attempt}): {e}", "warn")
+                        body = ""
+                    if is_complete_french_email(body):
+                        self.sig_log.emit(f"[{i+1}/{total}] LLM produced complete French body on attempt {attempt}", "info")
+                        break
+                    else:
+                        self.sig_log.emit(f"[{i+1}/{total}] LLM output failed completeness check (attempt {attempt})", "warn")
+                        # Emit truncated raw output for quick debugging
+                        try:
+                            self.sig_log.emit(f"[{i+1}/{total}] Raw LLM output (truncated): {raw[:800]}", "debug")
+                        except Exception:
+                            pass
+                        # If enabled in config, write full raw output to disk for post-mortem
+                        try:
+                            if cfg.get("llm_debug"):
+                                p = Path(f"llm_debug_gen_{i+1}_attempt{attempt}.txt")
+                                p.write_text(raw or "", encoding="utf-8")
+                                self.sig_log.emit(f"[{i+1}/{total}] Full LLM output written to {p}", "info")
+                        except Exception:
+                            pass
+                        if attempt < retries:
+                            time.sleep(1)
+                        # If subject present but body incomplete, try a focused repair prompt
+                        try:
+                            if subject and not is_complete_french_email(body):
+                                repair_tries = 2
+                                for r_i in range(1, repair_tries + 1):
+                                    repair_prompt = (
+                                        f"Le modèle a renvoyé ceci:\n{raw}\n\n"
+                                        f"Le sujet détecté est : {subject}\n"
+                                        "Le champ 'body' est manquant ou incomplet. En te basant uniquement sur le CV et le contexte fournis, retourne STRICTEMENT un objet JSON valide avec exactement les deux clés 'subject' et 'body' (aucun texte supplémentaire). Ne modifie pas le 'subject'. Le 'body' doit être en français et contenir explicitement les tokens : Portfolio, LinkedIn, GitHub, stage d'été, INSAT.\n"
+                                        f"CV:\n\"\"\"\n{self.cv_text}\n\"\"\"\n"
+                                        f"Contexte entreprise:\n\"\"\"\n{company_context}\n\"\"\"\n"
+                                    )
+                                    self.sig_log.emit(f"[{i+1}/{total}] Repair attempt {r_i} for body", "info")
+                                    repair_raw = llm.generate(repair_prompt)
+                                    try:
+                                        subject_r, body_r = parse_llm_json(repair_raw)
+                                    except Exception as e:
+                                        self.sig_log.emit(f"[{i+1}/{total}] Parse error from repair LLM attempt {r_i}: {e}", "warn")
+                                        body_r = ""
+                                    if is_complete_french_email(body_r):
+                                        body = body_r
+                                        subject = subject or subject_r or subject
+                                        self.sig_log.emit(f"[{i+1}/{total}] Repair succeeded on attempt {r_i}", "info")
+                                        break
+                                    time.sleep(1)
+                        except Exception:
+                            pass
+                        continue
+                if not is_complete_french_email(body):
+                    subject, body = build_french_fallback_email(
                         self.cv_text, contact, cfg["goal"], company_context,
                         sender_name=cfg.get("sender_name", ""),
                         sender_email=cfg.get("sender_email", ""),
                         sender_phone=cfg.get("sender_phone", ""),
                         sender_extra=cfg.get("sender_extra", ""),
                     )
-                )
-                subject, body = parse_llm_json(raw)
-                if not body.strip():
-                    raise ValueError("LLM returned empty body")
-                subject = subject or cfg["goal"]
+                    self.sig_log.emit(
+                        f"[{i+1}/{total}] Incomplete French body after {retries} attempts — using fallback French draft", "warn"
+                    )
+                subject = FIXED_EMAIL_SUBJECT
                 sender_name = resolve_sender_name(
                     self.cv_text,
                     cfg.get("sender_name", ""),
                     cfg.get("sender_email", ""),
                 )
+                # Ensure portfolio / links are present before appending signature
+                body = ensure_portfolio_links(body, cfg.get("sender_extra", ""))
                 signature = build_signature_block(
                     sender_name,
                     cfg.get("sender_email", ""),
@@ -1256,11 +1808,11 @@ class CampaignThread(QThread):
             existing: List = []
             if LOG_FILE.exists():
                 try:
-                    existing = json.loads(LOG_FILE.read_text())
+                    existing = json.loads(LOG_FILE.read_text(encoding="utf-8"))
                 except Exception:
                     pass
             existing.extend(self._log_records)
-            LOG_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+            LOG_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             self.sig_log.emit(f"Log save error: {e}", "warn")
 
@@ -1312,7 +1864,7 @@ class CampaignThread(QThread):
             self.sig_done.emit(failed == 0, summary)
             return
 
-        llm   = LLMClient(cfg["provider"], cfg["api_key"], cfg.get("model", ""))
+        llm   = LLMClient(cfg["provider"], cfg["api_key"], cfg.get("model", ""), llm_debug_provider=cfg.get("llm_debug_provider", False))
         total = len(self.contacts)
         sent = failed = 0
 
@@ -1338,7 +1890,14 @@ class CampaignThread(QThread):
                 self.sig_progress.emit(i + 1, total)
                 continue
 
-            company_context = ""
+            company_context = get_field(
+                contact,
+                "company_context",
+                "description",
+                "description_de_l_activite_anglais",
+                default="",
+            )
+            company_context = sanitize_company_context(company_context)
             if cfg.get("research"):
                 company = get_field(contact, "company", "organization", "employer", "firm",
                                     default="")
@@ -1346,10 +1905,12 @@ class CampaignThread(QThread):
                 if company:
                     self.sig_status.emit(f"Researching {company}…")
                     self._log(f"[{i+1}/{total}] Researching company: {company}", "info", email)
-                    company_context = self._researcher.research(company, website)
-                    if company_context:
+                    researched_context = self._researcher.research(company, website)
+                    if researched_context:
+                        researched_context = sanitize_company_context(researched_context)
+                        company_context = f"{company_context}\n\n{researched_context}".strip() if company_context else researched_context
                         self._log(
-                            f"[{i+1}/{total}] Context found ({len(company_context)} chars)",
+                            f"[{i+1}/{total}] Context found ({len(researched_context)} chars)",
                             "info", email,
                         )
                     else:
@@ -1358,24 +1919,114 @@ class CampaignThread(QThread):
             self.sig_status.emit(f"Generating email for {name}…")
             self._log(f"[{i+1}/{total}] Generating → {name} <{email}>", "info", email)
             try:
-                raw = llm.generate(
-                    build_prompt(
+                lang = "fr"
+                retries = int(cfg.get("llm_retries", 2))
+                subject = body = ""
+                for attempt in range(1, retries + 1):
+                    prompt_text = build_prompt(
+                        self.cv_text, contact, cfg["goal"], company_context,
+                        sender_name=cfg.get("sender_name", ""),
+                        sender_email=cfg.get("sender_email", ""),
+                        sender_phone=cfg.get("sender_phone", ""),
+                        sender_extra=cfg.get("sender_extra", ""),
+                        language=lang,
+                    )
+                    try:
+                        raw = llm.generate(prompt_text)
+                    except LLMProviderError as ple:
+                        self._log(f"[{i+1}/{total}] Provider {ple.provider} returned {ple.status_code} — attempting fallbacks", "warn", email)
+                        fallbacks = cfg.get("provider_fallbacks", [])
+                        fallback_succeeded = False
+                        for fb in fallbacks:
+                            try:
+                                p_name = fb.get("provider")
+                                p_key = fb.get("api_key")
+                                p_model = fb.get("model", "")
+                                if not p_name or not p_key:
+                                    continue
+                                self._log(f"[{i+1}/{total}] Trying fallback provider {p_name}", "info", email)
+                                fb_llm = LLMClient(p_name, p_key, p_model, llm_debug_provider=cfg.get("llm_debug_provider", False))
+                                raw = fb_llm.generate(prompt_text)
+                                fallback_succeeded = True
+                                llm = fb_llm
+                                break
+                            except Exception as e:
+                                self._log(f"[{i+1}/{total}] Fallback {fb.get('provider')} failed: {e}", "warn", email)
+                                continue
+                        if not fallback_succeeded:
+                            raise
+                    try:
+                        subject, body = parse_llm_json(raw)
+                    except Exception as e:
+                        self._log(f"[{i+1}/{total}] Parse error from LLM (attempt {attempt}): {e}", "warn", email)
+                        body = ""
+                    if is_complete_french_email(body):
+                        self._log(f"[{i+1}/{total}] LLM produced complete French body on attempt {attempt}", "info", email)
+                        break
+                    else:
+                        self._log(f"[{i+1}/{total}] LLM output failed completeness check (attempt {attempt})", "warn", email)
+                        try:
+                            self._log(f"[{i+1}/{total}] Raw LLM output (truncated): {raw[:800]}", "debug", email)
+                        except Exception:
+                            pass
+                        try:
+                            if cfg.get("llm_debug"):
+                                p = Path(f"llm_debug_campaign_{i+1}_attempt{attempt}.txt")
+                                p.write_text(raw or "", encoding="utf-8")
+                                self._log(f"[{i+1}/{total}] Full LLM output written to {p}", "info", email)
+                        except Exception:
+                            pass
+                        if attempt < retries:
+                            time.sleep(1)
+                        # If subject present but body incomplete, try a focused repair prompt
+                        try:
+                            if subject and not is_complete_french_email(body):
+                                repair_tries = 2
+                                for r_i in range(1, repair_tries + 1):
+                                    repair_prompt = (
+                                        f"Le modèle a renvoyé ceci:\n{raw}\n\n"
+                                        f"Le sujet détecté est : {subject}\n"
+                                        "Le champ 'body' est manquant ou incomplet. En te basant uniquement sur le CV et le contexte fournis, retourne STRICTEMENT un objet JSON valide avec exactement les deux clés 'subject' et 'body' (aucun texte supplémentaire). Ne modifie pas le 'subject'. Le 'body' doit être en français et contenir explicitement les tokens : Portfolio, LinkedIn, GitHub, stage d'été, INSAT.\n"
+                                        f"CV:\n\"\"\"\n{self.cv_text}\n\"\"\"\n"
+                                        f"Contexte entreprise:\n\"\"\"\n{company_context}\n\"\"\"\n"
+                                    )
+                                    self._log(f"[{i+1}/{total}] Repair attempt {r_i} for body", "info", email)
+                                    repair_raw = llm.generate(repair_prompt)
+                                    try:
+                                        subject_r, body_r = parse_llm_json(repair_raw)
+                                    except Exception as e:
+                                        self._log(f"[{i+1}/{total}] Parse error from repair LLM attempt {r_i}: {e}", "warn", email)
+                                        body_r = ""
+                                    if is_complete_french_email(body_r):
+                                        body = body_r
+                                        subject = subject or subject_r or subject
+                                        self._log(f"[{i+1}/{total}] Repair succeeded on attempt {r_i}", "info", email)
+                                        break
+                                    time.sleep(1)
+                        except Exception:
+                            pass
+                        continue
+                if not is_complete_french_email(body):
+                    subject, body = build_french_fallback_email(
                         self.cv_text, contact, cfg["goal"], company_context,
                         sender_name=cfg.get("sender_name", ""),
                         sender_email=cfg.get("sender_email", ""),
                         sender_phone=cfg.get("sender_phone", ""),
                         sender_extra=cfg.get("sender_extra", ""),
                     )
-                )
-                subject, body = parse_llm_json(raw)
-                if not body.strip():
-                    raise ValueError("LLM returned empty body")
-                subject = subject or cfg["goal"]
+                    self._log(
+                        f"[{i+1}/{total}] Incomplete French body after {retries} attempts — using fallback French draft",
+                        "warn", email,
+                    )
+                
+                subject = FIXED_EMAIL_SUBJECT
                 sender_name = resolve_sender_name(
                     self.cv_text,
                     cfg.get("sender_name", ""),
                     cfg.get("sender_email", ""),
                 )
+                # Ensure portfolio / links are present before appending signature
+                body = ensure_portfolio_links(body, cfg.get("sender_extra", ""))
                 signature = build_signature_block(
                     sender_name,
                     cfg.get("sender_email", ""),
@@ -1462,6 +2113,7 @@ class MainWindow(QMainWindow):
         self._sender_name  = ""
         self._sender_phone = ""
         self._sender_extra = ""
+        self._contacts_language = ""
         self._cv_llm_extracted = False
 
         self._build_ui()
@@ -1855,6 +2507,7 @@ class MainWindow(QMainWindow):
         try:
             self._csv_path = path
             self._contacts = load_contacts(path)
+            self._contacts_language = _contacts_language_for_path(path)
             name = Path(path).name
             self.lbl_csv.setText(name)
             self.lbl_csv.setStyleSheet(f"color: {C['text']}; font-size: 12px;")
@@ -1888,6 +2541,7 @@ class MainWindow(QMainWindow):
         try:
             self._csv_path = path
             self._contacts = load_contacts(path)
+            self._contacts_language = _contacts_language_for_path(path)
             name = Path(path).name
             self.lbl_csv.setText(name)
             self.lbl_csv.setStyleSheet(f"color: {C['text']}; font-size: 12px;")
@@ -1903,11 +2557,22 @@ class MainWindow(QMainWindow):
     def _start_cv_extraction(self):
         if self._cv_info_thread and self._cv_info_thread.isRunning():
             return
+        # Determine whether provider debug dumps are enabled in config.local.json
+        debug_flag = False
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    debug_flag = bool(cfg.get("llm_debug_provider", False))
+            except Exception:
+                debug_flag = False
+
         self._cv_info_thread = CVInfoThread(
             self._cv_text,
             provider=self.cmb_provider.currentText(),
             api_key=self.inp_api_key.text().strip(),
             model=self.inp_model.text().strip(),
+            llm_debug_provider=debug_flag,
         )
         self._cv_info_thread.sig_done.connect(self._on_cv_info)
         self._cv_info_thread.start()
@@ -1965,7 +2630,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _build_cfg(self) -> Dict[str, Any]:
-        return {
+        cfg = {
             "goal":         self.inp_goal.text().strip(),
             "provider":     self.cmb_provider.currentText(),
             "api_key":      self.inp_api_key.text().strip(),
@@ -1980,14 +2645,38 @@ class MainWindow(QMainWindow):
             "sender_email": self.inp_sender.text().strip(),
             "sender_phone": self._sender_phone,
             "sender_extra": self._sender_extra,
+            "language":     self._contacts_language,
         }
+        # If local config file contains debug flags, include them
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    file_cfg = json.load(f)
+                    cfg["llm_debug"] = bool(file_cfg.get("llm_debug", False))
+                    cfg["llm_debug_provider"] = bool(file_cfg.get("llm_debug_provider", False))
+                    # allow configuring number of LLM attempts per contact
+                    try:
+                        cfg["llm_retries"] = int(file_cfg.get("llm_retries", 4))
+                    except Exception:
+                        cfg["llm_retries"] = 4
+                    # optional provider fallback list: [{"provider":"Groq","api_key":"...","model":"..."}, ...]
+                    cfg["provider_fallbacks"] = file_cfg.get("provider_fallbacks", [])
+            except Exception:
+                cfg["llm_debug"] = False
+                cfg["llm_debug_provider"] = False
+        else:
+            cfg["llm_debug"] = False
+            cfg["llm_debug_provider"] = False
+            cfg["llm_retries"] = 4
+            cfg["provider_fallbacks"] = []
+
+        return cfg
 
     def _ensure_cv_extracted(self):
         if self._cv_text and not self._cv_llm_extracted and self.inp_api_key.text().strip():
             self._append_log("Extracting sender info from CV via LLM…", "info")
             self._start_cv_extraction()
-            if self._cv_info_thread:
-                self._cv_info_thread.wait()
+            self._append_log("CV extraction is running in the background; campaign will start now.", "info")
 
     def _start(self):
         err = self._validate()

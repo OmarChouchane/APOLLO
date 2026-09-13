@@ -4,8 +4,6 @@ setlocal
 cd /d "%~dp0"
 set "PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
 
-if not exist "%PYTHON_EXE%" set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
-
 if not exist "%PYTHON_EXE%" (
     echo Python 3.11 was not found at:
     echo %PYTHON_EXE%
@@ -13,4 +11,5 @@ if not exist "%PYTHON_EXE%" (
     exit /b 1
 )
 
-"%PYTHON_EXE%" "%~dp0email_outreach_app.py"
+"%PYTHON_EXE%" "%~dp0test_use_real_functions.py"
+pause
